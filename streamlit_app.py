@@ -214,11 +214,7 @@ def main():
             st.subheader("Structure Recognition using Fine-Tuned Model")
             st.markdown(
                 "Run the fine-tuned Table Transformer **structure** model (`model_17.pth`) "
-                "to detect rows, columns, headers, and spanning cells.\n\n"
-                "> ⚠️ **Important:** The structure model was trained on **tight table crops**, "
-                "not full pages. If your uploaded image is the full document page, the bounding "
-                "boxes will be misaligned. Upload a pre-cropped table image, or use a pipeline "
-                "that first runs a *detection* model to crop the table."
+                "to detect rows, columns, headers, and spanning cells."
             )
 
             if st.button("🚀 Run Table Transformer Inference"):
@@ -226,70 +222,22 @@ def main():
                     try:
                         pipeline = load_tatr_pipeline()
 
-                        # Convert deskewed BGR → PIL (no EXIF; fromarray is already
-                        # baked pixel data so img.size == actual pixel dimensions)
+                        # corrected_pil is the deskewed version of whatever the user uploaded.
+                        # Since the user uploads a pre-cropped table image, corrected_pil IS
+                        # the table — pass it directly to recognize(). No sub-cropping needed.
+                        # bboxes_after contains individual row/column annotations (not the
+                        # table boundary), so we must NOT use them to sub-crop here.
                         corrected_pil = Image.fromarray(
                             cv2.cvtColor(corrected, cv2.COLOR_BGR2RGB)
                         )
 
-                        # ----------------------------------------------------------
-                        # The structure model needs a TIGHT TABLE CROP.
-                        # If the user uploaded the full page, use bboxes_after
-                        # (from the Pascal-VOC XML or auto-detection) to crop the
-                        # table region before calling recognize().  Fall back to the
-                        # full image when no table bbox is available (user must
-                        # ensure the upload is already a cropped table in that case).
-                        # ----------------------------------------------------------
-                        table_bbox = None
-                        if bboxes_after:
-                            # Use the first annotation as the table boundary
-                            b = bboxes_after[0]
-                            x, y, w, h = int(b["x"]), int(b["y"]), int(b["w"]), int(b["h"])
-                            table_bbox = (x, y, x + w, y + h)
-
-                        if table_bbox is not None:
-                            crop_pil = corrected_pil.crop(table_bbox)
-                            st.info(
-                                f"Cropping to annotation bbox {table_bbox} before inference."
-                            )
-                        else:
-                            crop_pil = corrected_pil
-                            st.warning(
-                                "No table annotation found — running recognize() on the "
-                                "full image. Make sure the uploaded image is already a "
-                                "tight table crop, otherwise boxes will not align."
-                            )
-
-                        # recognize() outputs coords in crop_pil pixel space
-                        res = pipeline.recognize(crop_pil, out_objects=True)
+                        res = pipeline.recognize(corrected_pil, out_objects=True)
                         objects = res.get("objects", [])
 
                         if objects:
                             st.success(f"Detected {len(objects)} structure elements!")
-
-                            # Draw on the crop so coordinate spaces match
-                            viz_img = draw_boxes_on_image(crop_pil, objects)
-                            st.image(viz_img, use_container_width=True, caption="Drawn on table crop")
-
-                            # Also overlay on the full deskewed image if we cropped
-                            if table_bbox is not None:
-                                ox, oy = table_bbox[0], table_bbox[1]
-                                shifted = [
-                                    {**obj, "bbox": [
-                                        obj["bbox"][0] + ox,
-                                        obj["bbox"][1] + oy,
-                                        obj["bbox"][2] + ox,
-                                        obj["bbox"][3] + oy,
-                                    ]}
-                                    for obj in objects
-                                ]
-                                viz_full = draw_boxes_on_image(corrected_pil, shifted)
-                                st.image(
-                                    viz_full,
-                                    use_container_width=True,
-                                    caption="Overlaid on full deskewed page",
-                                )
-
+                            viz_img = draw_boxes_on_image(corrected_pil, objects)
+                            st.image(viz_img, use_container_width=True)
                             df_objects = pd.DataFrame(objects)[["label", "score", "bbox"]]
                             st.dataframe(df_objects, use_container_width=True)
                         else:
