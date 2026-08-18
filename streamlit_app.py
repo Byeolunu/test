@@ -1,0 +1,216 @@
+"""
+Streamlit web interface for image deskewing.
+Allows users to upload rotated images and download deskewed versions.
+
+Usage:
+    streamlit run deskewing/streamlit_app.py
+"""
+
+import streamlit as st
+import cv2
+import numpy as np
+from pathlib import Path
+import sys
+import io
+from PIL import Image
+import pandas as pd
+
+# Add parent directory to path to import deskew module
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from deskewing.deskew import deskew_image, parse_voc_xml, write_voc_xml
+
+
+def main():
+    st.set_page_config(
+        page_title="Document Deskewer",
+        page_icon="📄",
+        layout="wide",
+        initial_sidebar_state="expanded"
+    )
+    
+    st.title("📄 Document Deskewer")
+    st.markdown("Upload a rotated document image and get it automatically deskewed.")
+    
+    # Sidebar for settings and XML upload
+    with st.sidebar:
+        st.header("Settings")
+        st.markdown("---")
+
+        st.markdown("### 📎 Annotation XML (optional)")
+        st.markdown(
+            "Upload a **Pascal VOC** annotation XML that matches your image. "
+            "Bounding boxes will be geometrically rotated alongside the image "
+            "instead of being auto-detected."
+        )
+        xml_file = st.file_uploader("Upload annotation XML", type=["xml"])
+
+        st.markdown("---")
+        st.markdown("### About")
+        st.markdown("""
+        This tool uses adaptive document deskewing based on:
+        - **Bao et al. 2022** (Sensors 22, 7944)
+        
+        It automatically detects document type and applies:
+        - **Text**: SKLD + PPP
+        - **Form/Table**: Hough line detection
+        - **Complex**: Morphological clustering + FFT
+        """)
+    
+    # Main interface
+    col1, col2 = st.columns(2, gap="large")
+    
+    with col1:
+        st.subheader("📤 Upload Image")
+        uploaded_file = st.file_uploader(
+            "Choose an image file",
+            type=["jpg", "jpeg", "png", "bmp", "tiff"]
+        )
+    
+    if uploaded_file is not None:
+        # Read the uploaded image
+        file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
+        img_bgr = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+        
+        if img_bgr is None:
+            st.error("Failed to read image. Please try another file.")
+            return
+
+        # Parse XML bboxes if provided
+        xml_bboxes = None
+        if xml_file is not None:
+            try:
+                xml_bboxes = parse_voc_xml(xml_file.read())
+                st.sidebar.success(f"✅ Loaded {len(xml_bboxes)} annotations from XML")
+            except Exception as e:
+                st.sidebar.error(f"Failed to parse XML: {e}")
+
+        # Process the image
+        with st.spinner("Processing image..."):
+            try:
+                angle, corrected, img_type, bboxes_before, bboxes_after, viz_before, viz_after = \
+                    deskew_image(img_bgr, return_bboxes=True, xml_bboxes=xml_bboxes)
+            except Exception as e:
+                st.error(f"Error during deskewing: {str(e)}")
+                return
+        
+        # Display results in Tabs
+        tab1, tab2 = st.tabs(["✨ Standard View", "🔍 Bounding Box Visualization"])
+        
+        with tab1:
+            col_img1, col_img2 = st.columns(2, gap="large")
+            with col_img1:
+                st.subheader("Original Image")
+                img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+                st.image(img_rgb, use_container_width=True)
+            with col_img2:
+                st.subheader("Deskewed Image")
+                corrected_rgb = cv2.cvtColor(corrected, cv2.COLOR_BGR2RGB)
+                st.image(corrected_rgb, use_container_width=True)
+                
+        with tab2:
+            src_label = "XML Annotations" if xml_bboxes is not None else "Auto-detected"
+            col_viz1, col_viz2 = st.columns(2, gap="large")
+            with col_viz1:
+                st.subheader(f"Original — {src_label}")
+                viz_before_rgb = cv2.cvtColor(viz_before, cv2.COLOR_BGR2RGB)
+                st.image(viz_before_rgb, use_container_width=True)
+                st.caption(f"{len(bboxes_before)} bounding boxes")
+            with col_viz2:
+                st.subheader("Deskewed — Rotated Boxes")
+                viz_after_rgb = cv2.cvtColor(viz_after, cv2.COLOR_BGR2RGB)
+                st.image(viz_after_rgb, use_container_width=True)
+                st.caption(f"{len(bboxes_after)} bounding boxes")
+
+        # Bounding box coordinates expander
+        with st.expander("📊 Bounding Box Coordinates"):
+            coord_col1, coord_col2 = st.columns(2)
+            with coord_col1:
+                st.markdown("### Before Deskewing")
+                if bboxes_before:
+                    st.dataframe(
+                        pd.DataFrame(bboxes_before)[["label", "x", "y", "w", "h"]],
+                        use_container_width=True
+                    )
+                else:
+                    st.write("No bounding boxes.")
+            with coord_col2:
+                st.markdown("### After Deskewing")
+                if bboxes_after:
+                    st.dataframe(
+                        pd.DataFrame(bboxes_after)[["label", "x", "y", "w", "h"]],
+                        use_container_width=True
+                    )
+                else:
+                    st.write("No bounding boxes.")
+        
+        # Display metadata
+        st.markdown("---")
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.metric("Document Type", img_type.upper())
+        
+        with col2:
+            st.metric("Skew Angle", f"{angle:.2f}°")
+        
+        with col3:
+            st.metric("Original Dimensions", f"{img_bgr.shape[1]}×{img_bgr.shape[0]}")
+        
+        st.markdown("---")
+        
+        # Download buttons
+        col1, col2, col3, col4 = st.columns([1, 1, 1, 1])
+        
+        with col1:
+            corrected_pil = Image.fromarray(cv2.cvtColor(corrected, cv2.COLOR_BGR2RGB))
+            jpg_buffer = io.BytesIO()
+            corrected_pil.save(jpg_buffer, format="JPEG", quality=95)
+            jpg_buffer.seek(0)
+            st.download_button(
+                label="⬇️ Download JPG",
+                data=jpg_buffer,
+                file_name=f"deskewed_{uploaded_file.name.rsplit('.', 1)[0]}.jpg",
+                mime="image/jpeg"
+            )
+        
+        with col2:
+            png_buffer = io.BytesIO()
+            corrected_pil.save(png_buffer, format="PNG")
+            png_buffer.seek(0)
+            st.download_button(
+                label="⬇️ Download PNG",
+                data=png_buffer,
+                file_name=f"deskewed_{uploaded_file.name.rsplit('.', 1)[0]}.png",
+                mime="image/png"
+            )
+
+        with col3:
+            xml_out = write_voc_xml(
+                bboxes_after, corrected.shape,
+                filename=f"deskewed_{uploaded_file.name.rsplit('.', 1)[0]}"
+            )
+            st.download_button(
+                label="⬇️ Download XML",
+                data=xml_out.encode("utf-8"),
+                file_name=f"deskewed_{uploaded_file.name.rsplit('.', 1)[0]}.xml",
+                mime="application/xml"
+            )
+        
+        with col4:
+            st.info(f"✅ Rotation corrected by {abs(angle):.2f}°")
+    
+    else:
+        st.info("👆 Upload an image to get started!")
+        
+        with st.expander("💡 Tips"):
+            st.markdown("""
+            - **Best results** with clear document images
+            - Supports common formats: JPG, PNG, BMP, TIFF
+            - Upload a **Pascal VOC XML** in the sidebar to rotate your ground-truth annotations
+            - Works with text documents, forms, and tables
+            - Larger images may take a moment to process
+            """)
+
+
+if __name__ == "__main__":
+    main()
