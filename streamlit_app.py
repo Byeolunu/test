@@ -12,12 +12,97 @@ import numpy as np
 from pathlib import Path
 import sys
 import io
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 import pandas as pd
 
 # Add parent directory to path to import deskew module
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from deskewing.deskew import deskew_image, parse_voc_xml, write_voc_xml
+import torch
+
+
+@st.cache_resource
+def load_tatr_pipeline():
+    # Robustly find the repository root directory
+    root_dir = Path(__file__).resolve()
+    while root_dir.name != "table-transformer" and root_dir.parent != root_dir:
+        root_dir = root_dir.parent
+    
+    # Add necessary paths to sys.path
+    for path in [root_dir, root_dir / "src", root_dir / "detr"]:
+        p_str = str(path)
+        if p_str not in sys.path:
+            sys.path.append(p_str)
+            
+    from src.inference import TableExtractionPipeline
+    
+    model_path = "/home/nouhaila/DATA/table-transformer/FIN3/split_output/output/20260817183808/model_17.pth"
+    config_path = str(root_dir / "src" / "structure_config.json")
+    
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    pipeline = TableExtractionPipeline(
+        str_device=device,
+        str_config_path=config_path,
+        str_model_path=model_path
+    )
+    return pipeline
+
+
+def draw_boxes_on_image(img_path_or_pil, all_objects, out_path=None):
+    if isinstance(img_path_or_pil, Image.Image):
+        img = img_path_or_pil.copy().convert('RGB')
+    else:
+        img = Image.open(img_path_or_pil).convert('RGB')
+    draw = ImageDraw.Draw(img)
+    try:
+        font = ImageFont.load_default()
+    except Exception:
+        font = None
+
+    # color map for labels
+    colors = {}
+    palette = [(255, 0, 0), (0, 128, 255), (0, 200, 0), (255, 165, 0), (128, 0, 128), (255, 20, 147)]
+
+    for obj in all_objects:
+        label = obj.get('label', 'obj')
+        score = obj.get('score', None)
+        bbox = obj.get('bbox')
+        if bbox is None:
+            continue
+        try:
+            x1, y1, x2, y2 = [int(round(float(v))) for v in bbox]
+        except Exception:
+            continue
+
+        if label not in colors:
+            colors[label] = palette[len(colors) % len(palette)]
+        color = colors[label]
+
+        draw.rectangle([x1, y1, x2, y2], outline=color, width=3)
+        text = label + (f" {score:.2f}" if score is not None else "")
+        # Compute text size in a Pillow-version-compatible way
+        try:
+            if font is not None:
+                try:
+                    text_w, text_h = font.getsize(text)
+                except Exception:
+                    bbox = draw.textbbox((0, 0), text, font=font)
+                    text_w = bbox[2] - bbox[0]
+                    text_h = bbox[3] - bbox[1]
+            else:
+                bbox = draw.textbbox((0, 0), text)
+                text_w = bbox[2] - bbox[0]
+                text_h = bbox[3] - bbox[1]
+        except Exception:
+            # fallback estimate
+            text_w, text_h = (len(text) * 6, 10)
+
+        draw.rectangle([x1, y1 - text_h - 4, x1 + text_w + 4, y1], fill=color)
+        draw.text((x1 + 2, y1 - text_h - 2), text, fill=(255, 255, 255), font=font)
+
+    if out_path:
+        img.save(out_path)
+    return img
 
 
 def main():
@@ -94,7 +179,11 @@ def main():
                 return
         
         # Display results in Tabs
-        tab1, tab2 = st.tabs(["✨ Standard View", "🔍 Bounding Box Visualization"])
+        tab1, tab2, tab3 = st.tabs([
+            "✨ Standard View",
+            "🔍 Bounding Box Visualization",
+            "🤖 Table Transformer Inference"
+        ])
         
         with tab1:
             col_img1, col_img2 = st.columns(2, gap="large")
@@ -120,6 +209,94 @@ def main():
                 viz_after_rgb = cv2.cvtColor(viz_after, cv2.COLOR_BGR2RGB)
                 st.image(viz_after_rgb, use_container_width=True)
                 st.caption(f"{len(bboxes_after)} bounding boxes")
+
+        with tab3:
+            st.subheader("Structure Recognition using Fine-Tuned Model")
+            st.markdown(
+                "Run the fine-tuned Table Transformer **structure** model (`model_17.pth`) "
+                "to detect rows, columns, headers, and spanning cells.\n\n"
+                "> ⚠️ **Important:** The structure model was trained on **tight table crops**, "
+                "not full pages. If your uploaded image is the full document page, the bounding "
+                "boxes will be misaligned. Upload a pre-cropped table image, or use a pipeline "
+                "that first runs a *detection* model to crop the table."
+            )
+
+            if st.button("🚀 Run Table Transformer Inference"):
+                with st.spinner("Running model inference..."):
+                    try:
+                        pipeline = load_tatr_pipeline()
+
+                        # Convert deskewed BGR → PIL (no EXIF; fromarray is already
+                        # baked pixel data so img.size == actual pixel dimensions)
+                        corrected_pil = Image.fromarray(
+                            cv2.cvtColor(corrected, cv2.COLOR_BGR2RGB)
+                        )
+
+                        # ----------------------------------------------------------
+                        # The structure model needs a TIGHT TABLE CROP.
+                        # If the user uploaded the full page, use bboxes_after
+                        # (from the Pascal-VOC XML or auto-detection) to crop the
+                        # table region before calling recognize().  Fall back to the
+                        # full image when no table bbox is available (user must
+                        # ensure the upload is already a cropped table in that case).
+                        # ----------------------------------------------------------
+                        table_bbox = None
+                        if bboxes_after:
+                            # Use the first annotation as the table boundary
+                            b = bboxes_after[0]
+                            x, y, w, h = int(b["x"]), int(b["y"]), int(b["w"]), int(b["h"])
+                            table_bbox = (x, y, x + w, y + h)
+
+                        if table_bbox is not None:
+                            crop_pil = corrected_pil.crop(table_bbox)
+                            st.info(
+                                f"Cropping to annotation bbox {table_bbox} before inference."
+                            )
+                        else:
+                            crop_pil = corrected_pil
+                            st.warning(
+                                "No table annotation found — running recognize() on the "
+                                "full image. Make sure the uploaded image is already a "
+                                "tight table crop, otherwise boxes will not align."
+                            )
+
+                        # recognize() outputs coords in crop_pil pixel space
+                        res = pipeline.recognize(crop_pil, out_objects=True)
+                        objects = res.get("objects", [])
+
+                        if objects:
+                            st.success(f"Detected {len(objects)} structure elements!")
+
+                            # Draw on the crop so coordinate spaces match
+                            viz_img = draw_boxes_on_image(crop_pil, objects)
+                            st.image(viz_img, use_container_width=True, caption="Drawn on table crop")
+
+                            # Also overlay on the full deskewed image if we cropped
+                            if table_bbox is not None:
+                                ox, oy = table_bbox[0], table_bbox[1]
+                                shifted = [
+                                    {**obj, "bbox": [
+                                        obj["bbox"][0] + ox,
+                                        obj["bbox"][1] + oy,
+                                        obj["bbox"][2] + ox,
+                                        obj["bbox"][3] + oy,
+                                    ]}
+                                    for obj in objects
+                                ]
+                                viz_full = draw_boxes_on_image(corrected_pil, shifted)
+                                st.image(
+                                    viz_full,
+                                    use_container_width=True,
+                                    caption="Overlaid on full deskewed page",
+                                )
+
+                            df_objects = pd.DataFrame(objects)[["label", "score", "bbox"]]
+                            st.dataframe(df_objects, use_container_width=True)
+                        else:
+                            st.warning("No structure elements detected in the image.")
+
+                    except Exception as e:
+                        st.error(f"Failed to run inference: {e}")
 
         # Bounding box coordinates expander
         with st.expander("📊 Bounding Box Coordinates"):
