@@ -1,0 +1,356 @@
+"""
+Streamlit web interface for image deskewing.
+Allows users to upload rotated images and download deskewed versions.
+
+Usage:
+    streamlit run deskewing/streamlit_app.py
+"""
+
+import streamlit as st
+import cv2
+import numpy as np
+from pathlib import Path
+import sys
+import io
+from PIL import Image, ImageDraw, ImageFont
+import pandas as pd
+
+# Add parent directory to path to import deskew module
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from rotation_deskew.deskew import deskew_image, parse_voc_xml, write_voc_xml
+import torch
+
+
+@st.cache_resource
+def load_tatr_pipeline():
+    # Robustly find the repository root directory
+    root_dir = Path(__file__).resolve()
+    while root_dir.name != "table-transformer" and root_dir.parent != root_dir:
+        root_dir = root_dir.parent
+    
+    # Add necessary paths to sys.path
+    for path in [root_dir, root_dir / "src", root_dir / "detr"]:
+        p_str = str(path)
+        if p_str not in sys.path:
+            sys.path.append(p_str)
+            
+    from src.inference import TableExtractionPipeline
+    
+    model_path = "C:\\Users\\PREDATOR HELIOS 300\\Documents\\Stage\\tatr_mstsc\\tatr\\FIN3\\split_output\\output\\20260817183808\\model_20.pth"
+    config_path = str(root_dir / "src" / "structure_config.json")
+    
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    pipeline = TableExtractionPipeline(
+        str_device=device,
+        str_config_path=config_path,
+        str_model_path=model_path
+    )
+    return pipeline
+
+
+def draw_boxes_on_image(img_path_or_pil, all_objects, out_path=None):
+    if isinstance(img_path_or_pil, Image.Image):
+        img = img_path_or_pil.copy().convert('RGB')
+    else:
+        img = Image.open(img_path_or_pil).convert('RGB')
+    draw = ImageDraw.Draw(img)
+    try:
+        font = ImageFont.load_default()
+    except Exception:
+        font = None
+
+    # color map for labels
+    colors = {}
+    palette = [(255, 0, 0), (0, 128, 255), (0, 200, 0), (255, 165, 0), (128, 0, 128), (255, 20, 147)]
+
+    for obj in all_objects:
+        label = obj.get('label', 'obj')
+        score = obj.get('score', None)
+        bbox = obj.get('bbox')
+        if bbox is None:
+            continue
+        try:
+            x1, y1, x2, y2 = [int(round(float(v))) for v in bbox]
+        except Exception:
+            continue
+
+        if label not in colors:
+            colors[label] = palette[len(colors) % len(palette)]
+        color = colors[label]
+
+        draw.rectangle([x1, y1, x2, y2], outline=color, width=3)
+        text = label + (f" {score:.2f}" if score is not None else "")
+        # Compute text size in a Pillow-version-compatible way
+        try:
+            if font is not None:
+                try:
+                    text_w, text_h = font.getsize(text)
+                except Exception:
+                    bbox = draw.textbbox((0, 0), text, font=font)
+                    text_w = bbox[2] - bbox[0]
+                    text_h = bbox[3] - bbox[1]
+            else:
+                bbox = draw.textbbox((0, 0), text)
+                text_w = bbox[2] - bbox[0]
+                text_h = bbox[3] - bbox[1]
+        except Exception:
+            # fallback estimate
+            text_w, text_h = (len(text) * 6, 10)
+
+        draw.rectangle([x1, y1 - text_h - 4, x1 + text_w + 4, y1], fill=color)
+        draw.text((x1 + 2, y1 - text_h - 2), text, fill=(255, 255, 255), font=font)
+
+    if out_path:
+        img.save(out_path)
+    return img
+
+
+def main():
+    st.set_page_config(
+        page_title="Document Deskewer",
+        page_icon="📄",
+        layout="wide",
+        initial_sidebar_state="expanded"
+    )
+    
+    st.title("📄 Document Deskewer")
+    st.markdown("Upload a rotated document image and get it automatically deskewed.")
+    
+    # Sidebar for settings and XML upload
+    with st.sidebar:
+        st.header("Settings")
+        st.markdown("---")
+
+        st.markdown("### 📎 Annotation XML (optional)")
+        st.markdown(
+            "Upload a **Pascal VOC** annotation XML that matches your image. "
+            "Bounding boxes will be geometrically rotated alongside the image "
+            "instead of being auto-detected."
+        )
+        xml_file = st.file_uploader("Upload annotation XML", type=["xml"])
+
+        st.markdown("---")
+        st.markdown("### About")
+        st.markdown("""
+        This tool uses adaptive document deskewing based on:
+        - **Bao et al. 2022** (Sensors 22, 7944)
+        
+        It automatically detects document type and applies:
+        - **Text**: SKLD + PPP
+        - **Form/Table**: Hough line detection
+        - **Complex**: Morphological clustering + FFT
+        """)
+    
+    # Main interface
+    col1, col2 = st.columns(2, gap="large")
+    
+    with col1:
+        st.subheader("📤 Upload Image")
+        uploaded_file = st.file_uploader(
+            "Choose an image file",
+            type=["jpg", "jpeg", "png", "bmp", "tiff"]
+        )
+    
+    if uploaded_file is not None:
+        # Read the uploaded image
+        file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
+        img_bgr = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+        
+        if img_bgr is None:
+            st.error("Failed to read image. Please try another file.")
+            return
+
+        # Parse XML bboxes if provided
+        xml_bboxes = None
+        if xml_file is not None:
+            try:
+                xml_bboxes = parse_voc_xml(xml_file.read())
+                st.sidebar.success(f"✅ Loaded {len(xml_bboxes)} annotations from XML")
+            except Exception as e:
+                st.sidebar.error(f"Failed to parse XML: {e}")
+
+        # Process the image
+        with st.spinner("Processing image..."):
+            try:
+                angle, corrected, img_type, bboxes_before, bboxes_after, viz_before, viz_after = \
+                    deskew_image(img_bgr, return_bboxes=True, xml_bboxes=xml_bboxes)
+            except Exception as e:
+                st.error(f"Error during deskewing: {str(e)}")
+                return
+        
+        # Display results in Tabs
+        tab1, tab2, tab3 = st.tabs([
+            "✨ Standard View",
+            "🔍 Bounding Box Visualization",
+            "🤖 Table Transformer Inference"
+        ])
+        
+        with tab1:
+            col_img1, col_img2 = st.columns(2, gap="large")
+            with col_img1:
+                st.subheader("Original Image")
+                img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+                st.image(img_rgb, use_container_width=True)
+            with col_img2:
+                st.subheader("Deskewed Image")
+                corrected_rgb = cv2.cvtColor(corrected, cv2.COLOR_BGR2RGB)
+                st.image(corrected_rgb, use_container_width=True)
+                
+        with tab2:
+            src_label = "XML Annotations" if xml_bboxes is not None else "Auto-detected"
+            col_viz1, col_viz2 = st.columns(2, gap="large")
+            with col_viz1:
+                st.subheader(f"Original — {src_label}")
+                viz_before_rgb = cv2.cvtColor(viz_before, cv2.COLOR_BGR2RGB)
+                st.image(viz_before_rgb, use_container_width=True)
+                st.caption(f"{len(bboxes_before)} bounding boxes")
+            with col_viz2:
+                st.subheader("Deskewed — Rotated Boxes")
+                viz_after_rgb = cv2.cvtColor(viz_after, cv2.COLOR_BGR2RGB)
+                st.image(viz_after_rgb, use_container_width=True)
+                st.caption(f"{len(bboxes_after)} bounding boxes")
+
+        with tab3:
+            st.subheader("Structure Recognition using Fine-Tuned Model")
+            st.markdown(
+                "Run the fine-tuned Table Transformer **structure** model (`model_17.pth`) "
+                "to detect rows, columns, headers, and spanning cells."
+            )
+
+            st.markdown("### Crop Image Based on XML Bounding Box")
+            if bboxes_after:
+                st.markdown("Select a bounding box from the uploaded XML (or auto-detection) to crop the image before running inference.")
+                bbox_options = [f"{b.get('label', 'obj')} (x:{int(b['x'])}, y:{int(b['y'])}, w:{int(b['w'])}, h:{int(b['h'])})" for b in bboxes_after]
+                selected_bbox_idx = st.selectbox("Select bounding box to crop:", range(len(bbox_options)), format_func=lambda x: bbox_options[x])
+            else:
+                st.info("No XML annotations uploaded. Inference will run on the full image.")
+                selected_bbox_idx = None
+
+            if st.button("🚀 Run Table Transformer Inference"):
+                with st.spinner("Running model inference..."):
+                    try:
+                        pipeline = load_tatr_pipeline()
+
+                        corrected_pil = Image.fromarray(
+                            cv2.cvtColor(corrected, cv2.COLOR_BGR2RGB)
+                        )
+
+                        if selected_bbox_idx is not None:
+                            b = bboxes_after[selected_bbox_idx]
+                            crop_xmin = int(b['x'])
+                            crop_ymin = int(b['y'])
+                            crop_xmax = int(b['x'] + b['w'])
+                            crop_ymax = int(b['y'] + b['h'])
+                            
+                            corrected_pil = corrected_pil.crop((crop_xmin, crop_ymin, crop_xmax, crop_ymax))
+                            st.info(f"Image cropped to ({crop_xmin}, {crop_ymin}, {crop_xmax}, {crop_ymax}) using bounding box: {b.get('label', 'obj')}.")
+                            st.image(corrected_pil, caption="Cropped Input Image", use_container_width=True)
+
+                        res = pipeline.recognize(corrected_pil, out_objects=True)
+                        objects = res.get("objects", [])
+
+                        if objects:
+                            st.success(f"Detected {len(objects)} structure elements!")
+                            viz_img = draw_boxes_on_image(corrected_pil, objects)
+                            st.image(viz_img, use_container_width=True)
+                            df_objects = pd.DataFrame(objects)[["label", "score", "bbox"]]
+                            st.dataframe(df_objects, use_container_width=True)
+                        else:
+                            st.warning("No structure elements detected in the image.")
+
+                    except Exception as e:
+                        st.error(f"Failed to run inference: {e}")
+
+        # Bounding box coordinates expander
+        with st.expander("📊 Bounding Box Coordinates"):
+            coord_col1, coord_col2 = st.columns(2)
+            with coord_col1:
+                st.markdown("### Before Deskewing")
+                if bboxes_before:
+                    st.dataframe(
+                        pd.DataFrame(bboxes_before)[["label", "x", "y", "w", "h"]],
+                        use_container_width=True
+                    )
+                else:
+                    st.write("No bounding boxes.")
+            with coord_col2:
+                st.markdown("### After Deskewing")
+                if bboxes_after:
+                    st.dataframe(
+                        pd.DataFrame(bboxes_after)[["label", "x", "y", "w", "h"]],
+                        use_container_width=True
+                    )
+                else:
+                    st.write("No bounding boxes.")
+        
+        # Display metadata
+        st.markdown("---")
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.metric("Document Type", img_type.upper())
+        
+        with col2:
+            st.metric("Skew Angle", f"{angle:.2f}°")
+        
+        with col3:
+            st.metric("Original Dimensions", f"{img_bgr.shape[1]}×{img_bgr.shape[0]}")
+        
+        st.markdown("---")
+        
+        # Download buttons
+        col1, col2, col3, col4 = st.columns([1, 1, 1, 1])
+        
+        with col1:
+            corrected_pil = Image.fromarray(cv2.cvtColor(corrected, cv2.COLOR_BGR2RGB))
+            jpg_buffer = io.BytesIO()
+            corrected_pil.save(jpg_buffer, format="JPEG", quality=95)
+            jpg_buffer.seek(0)
+            st.download_button(
+                label="⬇️ Download JPG",
+                data=jpg_buffer,
+                file_name=f"deskewed_{uploaded_file.name.rsplit('.', 1)[0]}.jpg",
+                mime="image/jpeg"
+            )
+        
+        with col2:
+            png_buffer = io.BytesIO()
+            corrected_pil.save(png_buffer, format="PNG")
+            png_buffer.seek(0)
+            st.download_button(
+                label="⬇️ Download PNG",
+                data=png_buffer,
+                file_name=f"deskewed_{uploaded_file.name.rsplit('.', 1)[0]}.png",
+                mime="image/png"
+            )
+
+        with col3:
+            xml_out = write_voc_xml(
+                bboxes_after, corrected.shape,
+                filename=f"deskewed_{uploaded_file.name.rsplit('.', 1)[0]}"
+            )
+            st.download_button(
+                label="⬇️ Download XML",
+                data=xml_out.encode("utf-8"),
+                file_name=f"deskewed_{uploaded_file.name.rsplit('.', 1)[0]}.xml",
+                mime="application/xml"
+            )
+        
+        with col4:
+            st.info(f"✅ Rotation corrected by {abs(angle):.2f}°")
+    
+    else:
+        st.info("👆 Upload an image to get started!")
+        
+        with st.expander("💡 Tips"):
+            st.markdown("""
+            - **Best results** with clear document images
+            - Supports common formats: JPG, PNG, BMP, TIFF
+            - Upload a **Pascal VOC XML** in the sidebar to rotate your ground-truth annotations
+            - Works with text documents, forms, and tables
+            - Larger images may take a moment to process
+            """)
+
+
+if __name__ == "__main__":
+    main()
