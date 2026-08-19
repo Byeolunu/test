@@ -4,13 +4,12 @@ import argparse
 import sys
 import xml.etree.ElementTree as ET
 import os
-os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
 import random
 import io
 
 import torch
 from torchvision import transforms
-from PIL import Image, ImageOps
+from PIL import Image
 from fitz import Rect
 import numpy as np
 import pandas as pd
@@ -22,7 +21,7 @@ from matplotlib.patches import Patch
 
 from main import get_model
 import postprocess
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'detr'))
+sys.path.append("../detr")
 from models import build_model
 
 class MaxResize(object):
@@ -64,20 +63,19 @@ def get_class_map(data_type):
         class_map = {'table': 0, 'table rotated': 1, 'no object': 2}
     return class_map
 
-# Lowered thresholds so more table candidates are retained during inference.
 detection_class_thresholds = {
-    "table": 0.9,
-    "table rotated": 0.9,
+    "table": 0.5,
+    "table rotated": 0.5,
     "no object": 10
 }
 
 structure_class_thresholds = {
-    "table": 0.25,
-    "table column": 0.25,
-    "table row": 0.25,
-    "table column header": 0.25,
-    "table projected row header": 0.25,
-    "table spanning cell": 0.25,
+    "table": 0.5,
+    "table column": 0.5,
+    "table row": 0.5,
+    "table column header": 0.5,
+    "table projected row header": 0.5,
+    "table spanning cell": 0.5,
     "no object": 10
 }
 
@@ -574,29 +572,23 @@ def visualize_detected_tables(img, det_tables, out_path):
     plt.gcf().set_size_inches(20, 20)
     ax = plt.gca()
     
-    class_styles = {
-        'table': {'facecolor': (1, 0, 0.45), 'edgecolor': (1, 0, 0.45), 'hatch': '//////'},
-        'table rotated': {'facecolor': (0.95, 0.6, 0.1), 'edgecolor': (0.95, 0.6, 0.1), 'hatch': '//////'},
-        'table column': {'facecolor': (0.1, 0.6, 0.8), 'edgecolor': (0.1, 0.6, 0.8), 'hatch': '||||||'},
-        'table row': {'facecolor': (0.1, 0.8, 0.3), 'edgecolor': (0.1, 0.8, 0.3), 'hatch': '------'},
-        'table column header': {'facecolor': (0.9, 0.1, 0.9), 'edgecolor': (0.9, 0.1, 0.9), 'hatch': 'xxxxxx'},
-        'table projected row header': {'facecolor': (0.8, 0.5, 0.1), 'edgecolor': (0.8, 0.5, 0.1), 'hatch': '//////'},
-        'table spanning cell': {'facecolor': (0.5, 0.2, 0.9), 'edgecolor': (0.5, 0.2, 0.9), 'hatch': '\\\\\\\\\\\\'}
-    }
-
-    present_labels = set()
     for det_table in det_tables:
-        label = det_table['label']
-        if label not in class_styles:
-            continue
-        present_labels.add(label)
         bbox = det_table['bbox']
-        style = class_styles[label]
-        facecolor = style['facecolor']
-        edgecolor = style['edgecolor']
-        hatch = style['hatch']
-        alpha = 0.3
-        linewidth = 2
+
+        if det_table['label'] == 'table':
+            facecolor = (1, 0, 0.45)
+            edgecolor = (1, 0, 0.45)
+            alpha = 0.3
+            linewidth = 2
+            hatch='//////'
+        elif det_table['label'] == 'table rotated':
+            facecolor = (0.95, 0.6, 0.1)
+            edgecolor = (0.95, 0.6, 0.1)
+            alpha = 0.3
+            linewidth = 2
+            hatch='//////'
+        else:
+            continue
  
         rect = patches.Rectangle(bbox[:2], bbox[2]-bbox[0], bbox[3]-bbox[1], linewidth=linewidth, 
                                     edgecolor='none',facecolor=facecolor, alpha=0.1)
@@ -608,21 +600,15 @@ def visualize_detected_tables(img, det_tables, out_path):
                                     edgecolor=edgecolor,facecolor='none',linestyle='-', hatch=hatch, alpha=0.2)
         ax.add_patch(rect)
 
-        # Draw a text label on the bounding box
-        ax.text(bbox[0], bbox[1] - 4, label, color='white', fontsize=8, fontweight='bold',
-                bbox=dict(facecolor=edgecolor, alpha=0.8, edgecolor='none', boxstyle='square,pad=0.2'))
-
     plt.xticks([], [])
     plt.yticks([], [])
 
-    legend_elements = [
-        Patch(facecolor=class_styles[label]['facecolor'], edgecolor=class_styles[label]['edgecolor'],
-              label=label, hatch=class_styles[label]['hatch'], alpha=0.3)
-        for label in sorted(list(present_labels))
-    ]
-    if legend_elements:
-        plt.legend(handles=legend_elements, bbox_to_anchor=(0.5, -0.02), loc='upper center', borderaxespad=0,
-                        fontsize=10, ncol=min(4, len(legend_elements)))  
+    legend_elements = [Patch(facecolor=(1, 0, 0.45), edgecolor=(1, 0, 0.45),
+                                label='Table', hatch='//////', alpha=0.3),
+                        Patch(facecolor=(0.95, 0.6, 0.1), edgecolor=(0.95, 0.6, 0.1),
+                                label='Table (rotated)', hatch='//////', alpha=0.3)]
+    plt.legend(handles=legend_elements, bbox_to_anchor=(0.5, -0.02), loc='upper center', borderaxespad=0,
+                    fontsize=10, ncol=2)  
     plt.gcf().set_size_inches(10, 10)
     plt.axis('off')
     plt.savefig(out_path, bbox_inches='tight', dpi=150)
@@ -644,21 +630,18 @@ def visualize_cells(img, cells, out_path):
             alpha = 0.3
             linewidth = 2
             hatch='//////'
-            label_text = 'Header'
         elif cell['projected row header']:
             facecolor = (0.95, 0.6, 0.1)
             edgecolor = (0.95, 0.6, 0.1)
             alpha = 0.3
             linewidth = 2
             hatch='//////'
-            label_text = 'Proj Row Hdr'
         else:
             facecolor = (0.3, 0.74, 0.8)
             edgecolor = (0.3, 0.7, 0.6)
             alpha = 0.3
             linewidth = 2
             hatch='\\\\\\\\\\\\'
-            label_text = 'Data'
  
         rect = patches.Rectangle(bbox[:2], bbox[2]-bbox[0], bbox[3]-bbox[1], linewidth=linewidth, 
                                     edgecolor='none',facecolor=facecolor, alpha=0.1)
@@ -669,10 +652,6 @@ def visualize_cells(img, cells, out_path):
         rect = patches.Rectangle(bbox[:2], bbox[2]-bbox[0], bbox[3]-bbox[1], linewidth=0, 
                                     edgecolor=edgecolor,facecolor='none',linestyle='-', hatch=hatch, alpha=0.2)
         ax.add_patch(rect)
-
-        # Draw a text label on the cell
-        ax.text(bbox[0], bbox[1] - 4, label_text, color='white', fontsize=8, fontweight='bold',
-                bbox=dict(facecolor=edgecolor, alpha=0.8, edgecolor='none', boxstyle='square,pad=0.2'))
 
     plt.xticks([], [])
     plt.yticks([], [])
@@ -700,9 +679,6 @@ class TableExtractionPipeline(object):
 
         self.det_device = det_device
         self.str_device = str_device
-
-        self.det_model = None
-        self.str_model = None
 
         self.det_class_name2idx = get_class_map('detection')
         self.det_class_idx2name = {v:k for k, v in self.det_class_name2idx.items()}
@@ -734,14 +710,6 @@ class TableExtractionPipeline(object):
                 str_config = json.load(f)
             str_args = type('Args', (object,), str_config)
             str_args.device = str_device
-            # Validate class map and config consistency for structure model
-            class_map_check = get_class_map('structure')
-            if 'no object' not in class_map_check:
-                raise ValueError("Class map for 'structure' must include 'no object' label.")
-            if 'num_classes' in str_config:
-                expected = len(class_map_check) - 1
-                if str_config['num_classes'] != expected:
-                    raise ValueError(f"Structure config 'num_classes' ({str_config['num_classes']}) does not match the class map (expected {expected} excluding 'no object'). Update config or get_class_map.")
             self.str_model, _, _ = build_model(str_args)
             print("Structure model initialized.")
 
@@ -770,11 +738,8 @@ class TableExtractionPipeline(object):
         # Run input image through the model
         outputs = self.det_model([img_tensor.to(self.det_device)])
 
-        # Use the *resized* tensor dimensions for rescaling (same reason as recognize).
-        tensor_h, tensor_w = img_tensor.shape[1], img_tensor.shape[2]
-
         # Post-process detected objects, assign class labels
-        objects = outputs_to_objects(outputs, (tensor_w, tensor_h), self.det_class_idx2name)
+        objects = outputs_to_objects(outputs, img.size, self.det_class_idx2name)
         if out_objects:
             out_formats['objects'] = objects
         if not out_crops:
@@ -805,13 +770,8 @@ class TableExtractionPipeline(object):
         # Run input image through the model
         outputs = self.str_model([img_tensor.to(self.str_device)])
 
-        # Use the *resized* tensor dimensions (H, W) for rescaling, not the original
-        # img.size.  If img carries stale EXIF orientation the two can disagree on
-        # aspect ratio, which causes growing vertical drift across the page.
-        tensor_h, tensor_w = img_tensor.shape[1], img_tensor.shape[2]
-
         # Post-process detected objects, assign class labels
-        objects = outputs_to_objects(outputs, (tensor_w, tensor_h), self.str_class_idx2name)
+        objects = outputs_to_objects(outputs, img.size, self.str_class_idx2name)
         if out_objects:
             out_formats['objects'] = objects
         if not (out_cells or out_html or out_csv):
@@ -848,62 +808,51 @@ class TableExtractionPipeline(object):
 
         extracted_tables = []
         for table in cropped_tables:
-            cropped_img = table['image']
-            cropped_tokens = table['tokens']
+            img = table['image']
+            tokens = table['tokens']
 
-            extracted_table = {
-                'crops': [{'image': cropped_img, 'tokens': cropped_tokens}]
-            }
-
-            if self.str_model is not None:
-                recognized_table = self.recognize(cropped_img, tokens=cropped_tokens,
-                                                 out_objects=out_objects,
-                                                 out_cells=out_cells, out_html=out_html,
-                                                 out_csv=out_csv)
-                for key, val in recognized_table.items():
-                    extracted_table[key] = val
-
-            extracted_table['image'] = cropped_img
-            extracted_table['tokens'] = cropped_tokens
+            extracted_table = self.recognize(img, tokens=tokens, out_objects=out_objects,
+                                       out_cells=out_cells, out_html=out_html, out_csv=out_csv)
+            extracted_table['image'] = img
+            extracted_table['tokens'] = tokens
             extracted_tables.append(extracted_table)
 
         return extracted_tables
 
 
 def output_result(key, val, args, img, img_file):
-    base_name, ext = os.path.splitext(img_file)
     if key == 'objects':
         if args.verbose:
             print(val)
-        out_file = base_name + "_objects.json"
+        out_file = img_file.replace(".jpg", "_objects.json")
         with open(os.path.join(args.out_dir, out_file), 'w') as f:
             json.dump(val, f)
         if args.visualize:
-            out_file = base_name + "_fig_tables.jpg"
+            out_file = img_file.replace(".jpg", "_fig_tables.jpg")
             out_path = os.path.join(args.out_dir, out_file)
             visualize_detected_tables(img, val, out_path)
     elif not key == 'image' and not key == 'tokens':
         for idx, elem in enumerate(val):
             if key == 'crops':
                 for idx, cropped_table in enumerate(val):
-                    out_img_file = base_name + "_table_{}.jpg".format(idx)
+                    out_img_file = img_file.replace(".jpg", "_table_{}.jpg".format(idx))
                     cropped_table['image'].save(os.path.join(args.out_dir,
                                                                 out_img_file))
-                    out_words_file = os.path.splitext(out_img_file)[0] + "_words.json"
+                    out_words_file = out_img_file.replace(".jpg", "_words.json")
                     with open(os.path.join(args.out_dir, out_words_file), 'w') as f:
                         json.dump(cropped_table['tokens'], f)
             elif key == 'cells':
-                out_file = base_name + "_{}_objects.json".format(idx)
+                out_file = img_file.replace(".jpg", "_{}_objects.json".format(idx))
                 with open(os.path.join(args.out_dir, out_file), 'w') as f:
                     json.dump(elem, f)
                 if args.verbose:
                     print(elem)
                 if args.visualize:
-                    out_file = base_name + "_fig_cells.jpg"
+                    out_file = img_file.replace(".jpg", "_fig_cells.jpg")
                     out_path = os.path.join(args.out_dir, out_file)
                     visualize_cells(img, elem, out_path)
             else:
-                out_file = base_name + "_{}.{}".format(idx, key)
+                out_file = img_file.replace(".jpg", "_{}.{}".format(idx, key))
                 with open(os.path.join(args.out_dir, out_file), 'w') as f:
                     f.write(elem)
                 if args.verbose:
@@ -928,19 +877,18 @@ def main():
                                    str_model_path=args.structure_model_path)
 
     # Load images
-    valid_extensions = ('.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif')
-    img_files = [f for f in os.listdir(args.image_dir) if f.lower().endswith(valid_extensions)]
+    img_files = os.listdir(args.image_dir)
     num_files = len(img_files)
     random.shuffle(img_files)
 
     for count, img_file in enumerate(img_files):
         print("({}/{})".format(count+1, num_files))
         img_path = os.path.join(args.image_dir, img_file)
-        img = ImageOps.exif_transpose(Image.open(img_path)).convert("RGB")
+        img = Image.open(img_path)
         print("Image loaded.")
 
         if not args.words_dir is None:
-            tokens_path = os.path.join(args.words_dir, os.path.splitext(img_file)[0] + "_words.json")
+            tokens_path = os.path.join(args.words_dir, img_file.replace(".jpg", "_words.json"))
             with open(tokens_path, 'r') as f:
                 tokens = json.load(f)
 
@@ -984,9 +932,8 @@ def main():
 
             for table_idx, extracted_table in enumerate(extracted_tables):
                 for key, val in extracted_table.items():
-                    base, ext = os.path.splitext(img_file)
                     output_result(key, val, args, extracted_table['image'],
-                                  base + '_{}{}'.format(table_idx, ext))
+                                  img_file.replace('.jpg', '_{}.jpg'.format(table_idx)))
 
 if __name__ == "__main__":
     main()
